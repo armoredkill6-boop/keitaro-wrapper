@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Keitaro Wrapper — test_krylov_</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; max-width: 960px; }
+    .dirty { background: #fff8d6; padding: 12px; border-radius: 8px; margin: 8px 0; }
+    .clean { background: #f5f5f5; padding: 12px; border-radius: 8px; margin: 8px 0; }
+    .removed { color: #888; text-decoration: line-through; }
+    .error { color: #b00020; white-space: pre-wrap; }
+    input, button, select { margin: 4px 0; padding: 6px 10px; }
+    section { margin-bottom: 24px; }
+  </style>
+</head>
+<body>
+  <h1>Обёртка Keitaro (тестовое)</h1>
+  <p>Префикс кампаний: <code>test_krylov_</code></p>
+
+  <section>
+    <h2>1. Создать кампанию</h2>
+    <label>Имя (без префикса): <input id="campName" value="" placeholder="уникальное, напр. pe_final" /></label><br />
+    <label>Гео (ISO): <input id="campGeo" value="PE" maxlength="2" /></label><br />
+    <label>Offer ID: <input id="campOffer" type="number" value="4514" /></label><br />
+    <button id="btnCreate">Создать</button>
+    <pre id="createOut"></pre>
+  </section>
+
+  <section>
+    <h2>2. Редактор</h2>
+    <label>
+      Кампания (local id):
+      <select id="localSelect"><option value="">— выбери —</option></select>
+    </label>
+    <p id="listHint" style="color:#666">Список пустой, пока не создашь кампанию (кнопка выше).</p>
+    <p style="color:#666;font-size:14px">ТЗ: Remove → Bring back → Add offer → Pin → Push → Cancel. Жёлтая карточка = черновик.</p>
+    <button id="btnReloadList">Обновить список</button>
+    <button id="btnFetch">Fetch streams</button>
+    <div id="editorError" class="error"></div>
+    <div id="editor"></div>
+  </section>
+
+  <script>
+    async function api(path, opts = {}) {
+      const r = await fetch('/api' + path, opts);
+      const data = await r.json();
+      if (!r.ok) {
+        const msg = data.detail ? (typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail)) : JSON.stringify(data);
+        throw new Error(msg);
+      }
+      return data;
+    }
+
+    async function loadCampaignList() {
+      const sel = document.getElementById('localSelect');
+      const rows = await api('/campaigns');
+      sel.innerHTML = '<option value="">— выбери —</option>';
+      rows.forEach(row => {
+        const opt = document.createElement('option');
+        opt.value = row.id;
+        opt.textContent = row.id + ' — ' + row.name + ' (KT ' + row.keitaro_campaign_id + ')';
+        sel.appendChild(opt);
+      });
+      const hint = document.getElementById('listHint');
+      if (rows.length) {
+        sel.value = String(rows[0].id);
+        hint.textContent = 'Выбери кампанию или создай новую.';
+      } else {
+        hint.textContent = 'Список пустой — нажми «Создать» в блоке 1.';
+      }
+    }
+
+    async function openEditor(id) {
+      document.getElementById('editorError').textContent = '';
+      const data = await api('/campaigns/' + id + '/fetch', { method: 'POST' });
+      renderEditor(data);
+    }
+
+    document.getElementById('btnCreate').onclick = async () => {
+      const out = document.getElementById('createOut');
+      out.textContent = 'Создаю...';
+      out.className = '';
+      try {
+        const body = {
+          name: document.getElementById('campName').value,
+          country_code: document.getElementById('campGeo').value,
+          keitaro_offer_id: Number(document.getElementById('campOffer').value),
+        };
+        const data = await api('/campaigns', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        out.textContent = JSON.stringify(data, null, 2);
+        await loadCampaignList();
+        document.getElementById('localSelect').value = String(data.local_campaign_id);
+        await openEditor(data.local_campaign_id);
+      } catch (e) {
+        out.className = 'error';
+        out.textContent = e.message;
+      }
+    };
+
+    function renderEditor(data) {
+      const root = document.getElementById('editor');
+      root.innerHTML = '';
+      const h = document.createElement('h3');
+      h.textContent = data.name + ' (KT #' + data.keitaro_campaign_id + ', local #' + data.local_campaign_id + ')';
+      root.appendChild(h);
+
+      if (!data.streams.length) {
+        root.innerHTML += '<p class="error">Потоков нет. В Keitaro проверь кампанию — если 0, создай новую.</p>';
+        return;
+      }
+
+      data.streams.forEach(stream => {
+        const box = document.createElement('div');
+        box.className = stream.is_dirty ? 'dirty' : 'clean';
+        box.innerHTML = '<strong>' + stream.name + '</strong> (stream ' + stream.keitaro_stream_id + ')';
+        if (!stream.has_offers) {
+          box.innerHTML += '<p>Поток без офферов — детали редиректа не показываем.</p>';
+          root.appendChild(box);
+          return;
+        }
+
+        const ul = document.createElement('ul');
+        stream.offers.forEach(o => {
+          const li = document.createElement('li');
+          li.className = o.status === 'removed' ? 'removed' : '';
+          li.textContent = 'Offer ' + o.keitaro_offer_id + ' — ' + o.weight + '%' +
+            (o.weight_pinned ? ' (pinned)' : '') + (o.pending_add ? ' [new]' : '');
+          if (o.status === 'active') {
+            const pin = document.createElement('button');
+            pin.textContent = 'Pin';
+            pin.title = 'Закрепить вес, %';
+            pin.onclick = async () => {
+              const w = prompt('Вес оффера, %', String(o.weight));
+              if (w === null || w === '') return;
+              await api('/streams/' + stream.id + '/offers/' + o.id + '/pin', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ weight: Number(w) }),
+              });
+              const id = document.getElementById('localSelect').value;
+              await openEditor(id);
+            };
+            li.appendChild(pin);
+            const rm = document.createElement('button');
+            rm.textContent = 'Remove';
+            rm.onclick = async () => {
+              await api('/streams/' + stream.id + '/offers/' + o.id, { method: 'DELETE' });
+              const id = document.getElementById('localSelect').value;
+              await openEditor(id);
+            };
+            li.appendChild(rm);
+          }
+          if (o.status === 'removed') {
+            const bb = document.createElement('button');
+            bb.textContent = 'Bring back';
+            bb.onclick = async () => {
+              await api('/streams/' + stream.id + '/offers/' + o.id + '/bring-back', { method: 'POST' });
+              const id = document.getElementById('localSelect').value;
+              await openEditor(id);
+            };
+            li.appendChild(bb);
+          }
+          ul.appendChild(li);
+        });
+        box.appendChild(ul);
+
+        const addRow = document.createElement('div');
+        const offerIn = document.createElement('input');
+        offerIn.type = 'number';
+        offerIn.placeholder = 'Offer ID';
+        const addBtn = document.createElement('button');
+        addBtn.textContent = 'Add offer';
+        addBtn.onclick = async () => {
+          await api('/streams/' + stream.id + '/offers', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ keitaro_offer_id: Number(offerIn.value) }),
+          });
+          const id = document.getElementById('localSelect').value;
+          await openEditor(id);
+        };
+        addRow.append(offerIn, addBtn);
+        box.appendChild(addRow);
+
+        const actions = document.createElement('div');
+        const push = document.createElement('button');
+        push.textContent = 'Push to KT';
+        push.onclick = async () => {
+          const err = document.getElementById('editorError');
+          err.textContent = '';
+          try {
+            await api('/streams/' + stream.id + '/push', { method: 'POST' });
+            const id = document.getElementById('localSelect').value;
+            await openEditor(id);
+          } catch (e) {
+            err.textContent = e.message;
+          }
+        };
+        const cancel = document.createElement('button');
+        cancel.textContent = 'Cancel';
+        cancel.onclick = async () => {
+          await api('/streams/' + stream.id + '/cancel', { method: 'POST' });
+          const id = document.getElementById('localSelect').value;
+          await openEditor(id);
+        };
+        actions.append(push, cancel);
+        box.appendChild(actions);
+        root.appendChild(box);
+      });
+    }
+
+    document.getElementById('btnFetch').onclick = async () => {
+      const id = document.getElementById('localSelect').value;
+      if (!id) {
+        document.getElementById('editorError').textContent = 'Выбери кампанию из списка';
+        return;
+      }
+      try {
+        await openEditor(id);
+      } catch (e) {
+        document.getElementById('editorError').textContent = e.message;
+      }
+    };
+
+    document.getElementById('localSelect').onchange = async () => {
+      const id = document.getElementById('localSelect').value;
+      if (!id) return;
+      document.getElementById('editorError').textContent = '';
+      try {
+        await openEditor(id);
+      } catch (e) {
+        document.getElementById('editorError').textContent = e.message;
+      }
+    };
+
+    document.getElementById('btnReloadList').onclick = () => loadCampaignList().catch(e => {
+      document.getElementById('editorError').textContent = e.message;
+    });
+
+    (function () {
+      const el = document.getElementById('campName');
+      if (!el.value.trim()) el.value = 'pe4514_' + Date.now().toString().slice(-6);
+    })();
+
+    loadCampaignList().catch(() => {});
+  </script>
+</body>
+</html>
